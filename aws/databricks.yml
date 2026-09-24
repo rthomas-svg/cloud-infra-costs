@@ -9,13 +9,13 @@ include:
 variables:
   catalog:
     description: "Catalog where volume and tables will be configured"
-    default: billing
+    default: data_ue1_prd
   schema:
     description: "Schema where volume and tables will be configured"
-    default: aws
+    default: metrics
   volume_name:
     description: "Name of volume"
-    default: cost_export
+    default: aws_cost_and_usage
   bronze_table_name:
     description: "Name of bronze table"
     default: aws_cost_and_usage_bronze
@@ -30,13 +30,13 @@ variables:
     default: aws_cost_and_usage_tracking
   storage_location:
     description: "Folder within a Storage Account's Container where AWS Cost and Usage Reports (CUR) is exporting files to (ending with '/')"
-    default: s3://daniel-martinez-databricks/cost-reports/exports/cost-data-exports-aws/
+    default: s3://cid-987209738183-data-local/
   warehouse_id:
     description: "Id of SQL warehouse that the dashboard uses"
-    default: 862f1d757f0424f7
+    default: 2fb1c413e5c3ddee
   job_alerts_email:
     description: "Email to send alerts in case of job failures"
-    default: daniel.martinez@databricks.com
+    default: rthomas@sovrn.com
 
 targets:
   # The 'dev' target, for development purposes. This target is the default.
@@ -44,6 +44,6 @@ targets:
     mode: development
     default: true
     run_as:
-      # This runs as daniel.martinez@databricks.com in production. We could also use a service principal here,
+      # This runs as rthomas@sovrn.com in production. We could also use a service principal here,
       # see https://docs.databricks.com/dev-tools/bundles/permissions.html.
-      user_name: daniel.martinez@databricks.com
+      user_name: rthomas@sovrn.com
