@@ -14,7 +14,7 @@ USING (
     ('product', 'data-platform', 'dataplatform', NULL),
     ('product', 'data-product', 'dataplatform', 'Assumed dataplatform'),
     ('product', 'data-science', 'datascience', NULL),
-    ('product', 'data_sales', NULL, 'Pending open decision 2 on SDP-4201'),
+    ('product', 'data_sales', 'commerce', 'Open decision 2 on SDP-4201: data_sales maps to commerce'),
     ('product', 'dataplatform', 'dataplatform', NULL),
     ('product', 'exchange', 'exchange', NULL),
     ('product', 'genie-poc', 'dataplatform', 'Assumed dataplatform'),
