@@ -87,6 +87,9 @@
         "    -- There are matched tag records, then records with tags that dont match the ask, then totally untagged resources\n",
         "    COALESCE(IsMatched, '<NOT TAGGED>') AS IsMatchedClean,\n",
         "    array_distinct(mt.matched_tags_array) AS kvp,\n",
+        "    -- SDP-4202: standardized tag values via tag_value_map (DBU side)\n",
+        "    pm.standard_value AS product_std,\n",
+        "    COALESCE(am.standard_value, lower(trim(coalesce(billing_usage.custom_tags['Application'], billing_usage.custom_tags['application'])))) AS application_std,\n",
         "    SUM(usage_quantity * pricing ['default']) AS usage_cost_dollars\n",
         " FROM\n",
         "   billing_usage\n",
@@ -99,6 +102,8 @@
         "     OR price_end_time >= usage_start_time\n",
         "   )\n",
         "   LEFT JOIN matched_records as mt ON billing_usage.record_id = mt.record_id\n",
+        "   LEFT JOIN IDENTIFIER(:tag_map_table) pm ON pm.tag_key = 'product' AND pm.current_value = lower(trim(coalesce(billing_usage.custom_tags['Product'], billing_usage.custom_tags['product'])))\n",
+        "   LEFT JOIN IDENTIFIER(:tag_map_table) am ON am.tag_key = 'application' AND am.current_value = lower(trim(coalesce(billing_usage.custom_tags['Application'], billing_usage.custom_tags['application'])))\n",
         " GROUP BY\n",
         "   ALL\n",
         "),\n",
@@ -137,7 +142,9 @@
         "      WHEN :cloud_cost_type = 'Amortized' THEN amortized_cost\n",
         "      WHEN :cloud_cost_type = 'Net Amortized' THEN net_amortized_cost\n",
         "      ELSE 0\n",
-        "    END,0)) AS total_cloud_cost_dollars\n",
+        "    END,0)) AS total_cloud_cost_dollars,\n",
+        "    max(product_std) AS product_std,\n",
+        "    max(application_std) AS application_std\n",
         " FROM IDENTIFIER(:gold_table)\n",
         " GROUP BY ALL\n",
         ")\n",
@@ -151,6 +158,8 @@
         "  ELSE ''\n",
         "  END AS compute_id,\n",
         "  COALESCE(billing_usage_with_price.sku_name, 'Not identified') as sku_name,\n",
+        "  COALESCE(billing_usage_with_price.product_std, cloud_infra_cost.product_std, '<UNMAPPED>') AS product_std,\n",
+        "  COALESCE(billing_usage_with_price.application_std, cloud_infra_cost.application_std, '<UNTAGGED>') AS application_std,\n",
         "  COALESCE(billing_usage_with_price.job_id,cloud_infra_cost.job_id,'') as job_id,\n",
         "  COALESCE(billing_usage_with_price.cluster_id,cloud_infra_cost.cluster_id) as cluster_id,\n",
         "  COALESCE(CASE\n",
@@ -299,6 +308,21 @@
               ]
             }
           }
+        },
+        {
+          "displayName": "tag_map_table",
+          "keyword": "tag_map_table",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "governance.aws.tag_value_map"
+                }
+              ]
+            }
+          }
         }
       ],
       "catalog": "governance",
@@ -344,7 +368,7 @@
       "queryLines": [
         "-- =====================================================================\n",
         "-- Databricks AWS cost by job: six-week trend\n",
-        "-- Six complete Sun\u2013Sat weeks (same weeks as the Infrastructure Operating\n",
+        "-- Six complete Sun–Sat weeks (same weeks as the Infrastructure Operating\n",
         "-- Sheet). w1 = oldest, w6 = most recent complete week.\n",
         "-- delta / pct_change compare w6 vs w5 only; the other columns show trend.\n",
         "--\n",
@@ -352,7 +376,7 @@
         "--   account_id : AWS account to analyze (327389247698 = Databricks (AWS))\n",
         "--   weeks_back : 0 = ends with the latest complete week; 1 = shift back a week, etc.\n",
         "--\n",
-        "-- Run Tuesday or later: CUR and system.billing data can lag 24\u201348h.\n",
+        "-- Run Tuesday or later: CUR and system.billing data can lag 24–48h.\n",
         "-- =====================================================================\n",
         "WITH params AS (\n",
         "  SELECT\n",
@@ -917,7 +941,7 @@
             "multilineTextboxSpec": {
               "lines": [
                 "## Week-over-Week AWS Compute Cost Analysis\n",
-                "Identifying jobs with abnormal cost changes \u2014 biggest movers, sustained trends, and anomalies compared to their 4-week baseline."
+                "Identifying jobs with abnormal cost changes — biggest movers, sustained trends, and anomalies compared to their 4-week baseline."
               ]
             }
           },
@@ -1188,7 +1212,7 @@
                 },
                 "y": {
                   "fieldName": "w6_vs_w1_w4_avg_pct",
-                  "displayName": "W6 vs W1\u2013W4 Avg %",
+                  "displayName": "W6 vs W1–W4 Avg %",
                   "scale": {
                     "type": "quantitative"
                   }
@@ -2837,6 +2861,165 @@
             "y": 11,
             "width": 6,
             "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "5d1a7c3e",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "9190182f",
+                  "fields": [
+                    {
+                      "name": "product_std",
+                      "expression": "`product_std`"
+                    },
+                    {
+                      "name": "application_std",
+                      "expression": "`application_std`"
+                    },
+                    {
+                      "name": "sum(databricks_cost_dollars)",
+                      "expression": "SUM(`databricks_cost_dollars`)"
+                    },
+                    {
+                      "name": "sum(cloud_cost_compute_dollars)",
+                      "expression": "SUM(`cloud_cost_compute_dollars`)"
+                    },
+                    {
+                      "name": "sum(cloud_cost_storage_dollars)",
+                      "expression": "SUM(`cloud_cost_storage_dollars`)"
+                    },
+                    {
+                      "name": "sum(cloud_cost_networking_dollars)",
+                      "expression": "SUM(`cloud_cost_networking_dollars`)"
+                    }
+                  ],
+                  "cubeGroupingSets": {
+                    "sets": [
+                      {
+                        "fieldNames": [
+                          "product_std",
+                          "application_std"
+                        ]
+                      },
+                      {
+                        "fieldNames": [
+                          "product_std"
+                        ]
+                      },
+                      {}
+                    ]
+                  },
+                  "disaggregated": false,
+                  "orders": [
+                    {
+                      "direction": "ASC",
+                      "expression": "`product_std`"
+                    },
+                    {
+                      "direction": "ASC",
+                      "expression": "`application_std`"
+                    }
+                  ]
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "pivot",
+              "encodings": {
+                "rows": [
+                  {
+                    "fieldName": "product_std",
+                    "displayTotal": true,
+                    "displayName": "Product (std)"
+                  },
+                  {
+                    "fieldName": "application_std",
+                    "displayTotal": true,
+                    "displayName": "Application (std)"
+                  }
+                ],
+                "cell": {
+                  "type": "multi-cell",
+                  "fields": [
+                    {
+                      "fieldName": "sum(databricks_cost_dollars)",
+                      "cellType": "text",
+                      "format": {
+                        "type": "number-currency",
+                        "currencyCode": "USD",
+                        "abbreviation": "compact",
+                        "decimalPlaces": {
+                          "type": "exact",
+                          "places": 2
+                        },
+                        "hideGroupSeparator": true
+                      },
+                      "displayName": "Databricks"
+                    },
+                    {
+                      "fieldName": "sum(cloud_cost_compute_dollars)",
+                      "cellType": "text",
+                      "format": {
+                        "type": "number-currency",
+                        "currencyCode": "USD",
+                        "abbreviation": "compact",
+                        "decimalPlaces": {
+                          "type": "exact",
+                          "places": 2
+                        },
+                        "hideGroupSeparator": true
+                      },
+                      "displayName": "AWS Compute"
+                    },
+                    {
+                      "fieldName": "sum(cloud_cost_storage_dollars)",
+                      "cellType": "text",
+                      "format": {
+                        "type": "number-currency",
+                        "currencyCode": "USD",
+                        "abbreviation": "compact",
+                        "decimalPlaces": {
+                          "type": "exact",
+                          "places": 2
+                        },
+                        "hideGroupSeparator": true
+                      },
+                      "displayName": "AWS Storage"
+                    },
+                    {
+                      "fieldName": "sum(cloud_cost_networking_dollars)",
+                      "cellType": "text",
+                      "format": {
+                        "type": "number-currency",
+                        "currencyCode": "USD",
+                        "abbreviation": "compact",
+                        "decimalPlaces": {
+                          "type": "exact",
+                          "places": 2
+                        },
+                        "hideGroupSeparator": true
+                      },
+                      "displayName": "AWS Networking"
+                    }
+                  ]
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Cost by standardized product and application (tag_value_map)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 17,
+            "width": 6,
+            "height": 8
           }
         }
       ],
