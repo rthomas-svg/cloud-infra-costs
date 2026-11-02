@@ -294,7 +294,7 @@
               "dataType": "STRING",
               "values": [
                 {
-                  "value": "billing.aws.aws_cost_and_usage_gold"
+                  "value": "governance.aws.aws_cost_and_usage_gold"
                 }
               ]
             }
