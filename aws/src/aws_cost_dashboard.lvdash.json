@@ -300,7 +300,9 @@
             }
           }
         }
-      ]
+      ],
+      "catalog": "governance",
+      "schema": "aws"
     },
     {
       "name": "c9c643a9",
@@ -335,6 +337,134 @@
         "  'system.billing.account_prices'\n",
         ")) as toggle"
       ]
+    },
+    {
+      "name": "aa7078b8",
+      "displayName": "wow_cost_by_job",
+      "queryLines": [
+        "-- =====================================================================\n",
+        "-- Databricks AWS cost by job: six-week trend\n",
+        "-- Six complete Sun\u2013Sat weeks (same weeks as the Infrastructure Operating\n",
+        "-- Sheet). w1 = oldest, w6 = most recent complete week.\n",
+        "-- delta / pct_change compare w6 vs w5 only; the other columns show trend.\n",
+        "--\n",
+        "-- Settings (edit in the params CTE):\n",
+        "--   account_id : AWS account to analyze (327389247698 = Databricks (AWS))\n",
+        "--   weeks_back : 0 = ends with the latest complete week; 1 = shift back a week, etc.\n",
+        "--\n",
+        "-- Run Tuesday or later: CUR and system.billing data can lag 24\u201348h.\n",
+        "-- =====================================================================\n",
+        "WITH params AS (\n",
+        "  SELECT\n",
+        "    '327389247698' AS account_id,\n",
+        "    0              AS weeks_back\n",
+        "),\n",
+        "dates AS (\n",
+        "  -- dayofweek(): Sunday = 1 ... Saturday = 7 -> most recent completed Saturday\n",
+        "  SELECT\n",
+        "    p.account_id,\n",
+        "    date_sub(current_date(), dayofweek(current_date()) + 7 * p.weeks_back)      AS end_date,\n",
+        "    date_sub(current_date(), dayofweek(current_date()) + 7 * p.weeks_back + 41) AS start_date\n",
+        "  FROM params p\n",
+        "),\n",
+        "names AS (\n",
+        "  -- Map job_id -> job name. Airflow-submitted (one-time) runs get a new job_id\n",
+        "  -- every run, so grouping by name is what makes week-over-week comparisons work.\n",
+        "  SELECT\n",
+        "    u.usage_metadata.job_id AS job_id,\n",
+        "    max(coalesce(u.usage_metadata.job_name, u.usage_metadata.job_run_id)) AS job_name\n",
+        "  FROM system.billing.usage u\n",
+        "  CROSS JOIN dates d\n",
+        "  WHERE u.usage_date BETWEEN d.start_date AND d.end_date\n",
+        "    AND u.usage_metadata.job_id IS NOT NULL\n",
+        "  GROUP BY 1\n",
+        "),\n",
+        "raw_costs AS (\n",
+        "  SELECT\n",
+        "    -- 6 = most recent week, 1 = oldest\n",
+        "    6 - floor(datediff(d.end_date, cast(g.usage_date AS DATE)) / 7) AS wk,\n",
+        "    coalesce(n.job_name, 'unattributed') AS raw_name,\n",
+        "    g.amortized_cost\n",
+        "  FROM governance.aws.aws_cost_and_usage_gold g\n",
+        "  CROSS JOIN dates d\n",
+        "  LEFT JOIN names n ON g.usage_metadata.job_id = n.job_id\n",
+        "  WHERE g.cloud_account_id = d.account_id\n",
+        "    AND g.charge_type = 'Compute'          -- remove to include Storage and Networking\n",
+        "    AND cast(g.usage_date AS DATE) BETWEEN d.start_date AND d.end_date\n",
+        "),\n",
+        "costs AS (\n",
+        "  SELECT\n",
+        "    wk,\n",
+        "    raw_name,\n",
+        "    CASE\n",
+        "      -- Roll up consent_ue1_*, creative_ue1_*, consent_ew1_*, creative_ew1_* into a single row\n",
+        "      WHEN raw_name RLIKE '^(consent|creative)_(ue1|ew1)_'\n",
+        "        THEN 'consent/creative (combined)'\n",
+        "      -- Replace any datestamp in the name with <date> so dated variants group together.\n",
+        "      -- Matches YYYYMMDD, YYYY-MM-DD, YYYY_MM_DD, optionally followed by HH, HHMM or HHMMSS\n",
+        "      -- (e.g. 2026100614, 2026-10-06T14:30). The digit guards on each side keep it from\n",
+        "      -- matching inside longer numbers such as job/run IDs.\n",
+        "      ELSE regexp_replace(\n",
+        "        raw_name,\n",
+        "        '(?<![0-9])(19|20)[0-9]{2}[-_]?(0[1-9]|1[0-2])[-_]?(0[1-9]|[12][0-9]|3[01])([T_ -]?[0-9]{2}(:?[0-9]{2}){0,2})?(?![0-9])',\n",
+        "        '<date>'\n",
+        "      )\n",
+        "    END AS job_name,\n",
+        "    amortized_cost\n",
+        "  FROM raw_costs\n",
+        "),\n",
+        "by_job AS (\n",
+        "  SELECT\n",
+        "    job_name,\n",
+        "    count(DISTINCT raw_name) AS n_names,   -- how many original job names rolled into this row\n",
+        "    coalesce(sum(CASE WHEN wk = 1 THEN amortized_cost END), 0) AS w1,\n",
+        "    coalesce(sum(CASE WHEN wk = 2 THEN amortized_cost END), 0) AS w2,\n",
+        "    coalesce(sum(CASE WHEN wk = 3 THEN amortized_cost END), 0) AS w3,\n",
+        "    coalesce(sum(CASE WHEN wk = 4 THEN amortized_cost END), 0) AS w4,\n",
+        "    coalesce(sum(CASE WHEN wk = 5 THEN amortized_cost END), 0) AS w5,\n",
+        "    coalesce(sum(CASE WHEN wk = 6 THEN amortized_cost END), 0) AS w6,\n",
+        "    0 AS sort_key\n",
+        "  FROM costs\n",
+        "  GROUP BY job_name\n",
+        "),\n",
+        "with_total AS (\n",
+        "  SELECT * FROM by_job\n",
+        "  UNION ALL\n",
+        "  SELECT 'TOTAL (all jobs)', sum(n_names), sum(w1), sum(w2), sum(w3), sum(w4), sum(w5), sum(w6), 1\n",
+        "  FROM by_job\n",
+        "),\n",
+        "stats AS (\n",
+        "  SELECT\n",
+        "    *,\n",
+        "    least(w1, w2, w3, w4, w5, w6)    AS mn,\n",
+        "    greatest(w1, w2, w3, w4, w5, w6) AS mx,\n",
+        "    (w1 + w2 + w3 + w4) / 4          AS avg_w1_w4\n",
+        "  FROM with_total\n",
+        ")\n",
+        "SELECT\n",
+        "  s.job_name,\n",
+        "  s.n_names,\n",
+        "  round(s.w1, 0) AS w1, round(s.w2, 0) AS w2, round(s.w3, 0) AS w3,\n",
+        "  round(s.w4, 0) AS w4, round(s.w5, 0) AS w5, round(s.w6, 0) AS w6,\n",
+        "  round(s.w6 - s.w5, 2)                                 AS delta,\n",
+        "  round(try_divide(s.w6 - s.w5, s.w5) * 100, 1)         AS pct_change,\n",
+        "  round(try_divide(s.w6 - s.avg_w1_w4, s.avg_w1_w4) * 100, 1) AS w6_vs_w1_w4_avg_pct,\n",
+        "  CASE\n",
+        "    WHEN s.sort_key = 1 THEN concat('w1 starts ', date_format(date_sub(d.end_date, 41), 'MM/dd'),\n",
+        "                                    ', w6 starts ', date_format(date_sub(d.end_date, 6), 'MM/dd'))\n",
+        "    WHEN s.w5 = 0 AND s.w6 > 0 AND s.w1 + s.w2 + s.w3 + s.w4 = 0 THEN 'new'\n",
+        "    WHEN s.w5 = 0 AND s.w6 > 0 THEN 'returned'\n",
+        "    WHEN s.w6 = 0 AND s.w5 > 0 THEN 'stopped'\n",
+        "    WHEN s.w4 < s.w5 AND s.w5 < s.w6 THEN 'rising 3 wks'\n",
+        "    WHEN s.w4 > s.w5 AND s.w5 > s.w6 THEN 'falling 3 wks'\n",
+        "  END                                                   AS status\n",
+        "FROM stats s\n",
+        "CROSS JOIN dates d\n",
+        "ORDER BY s.sort_key DESC, abs(s.w6 - s.w5) DESC\n",
+        "LIMIT 1000\n"
+      ],
+      "catalog": "data_ue1_dev",
+      "schema": "adhoc"
     }
   ],
   "pages": [
@@ -776,6 +906,976 @@
         }
       ],
       "pageType": "PAGE_TYPE_CANVAS"
+    },
+    {
+      "name": "7c140238",
+      "displayName": "WoW Cost by Job",
+      "layout": [
+        {
+          "widget": {
+            "name": "wow_header",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Week-over-Week AWS Compute Cost Analysis\n",
+                "Identifying jobs with abnormal cost changes \u2014 biggest movers, sustained trends, and anomalies compared to their 4-week baseline."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 12,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "total_w6",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "aa7078b8",
+                  "fields": [
+                    {
+                      "name": "w6",
+                      "expression": "`w6`"
+                    }
+                  ],
+                  "filters": [
+                    {
+                      "expression": "`job_name` IN ('TOTAL (all jobs)')"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "frame": {
+                "showTitle": true,
+                "title": "Latest Week Spend"
+              },
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "w6"
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "total_delta",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "aa7078b8",
+                  "fields": [
+                    {
+                      "name": "delta",
+                      "expression": "`delta`"
+                    }
+                  ],
+                  "filters": [
+                    {
+                      "expression": "`job_name` IN ('TOTAL (all jobs)')"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "frame": {
+                "showTitle": true,
+                "title": "WoW Change"
+              },
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "delta"
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 2,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "flagged_count",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "aa7078b8",
+                  "fields": [
+                    {
+                      "name": "count(status)",
+                      "expression": "COUNT(`status`)"
+                    }
+                  ],
+                  "filters": [
+                    {
+                      "expression": "`job_name` NOT IN ('TOTAL (all jobs)')"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "frame": {
+                "showTitle": true,
+                "title": "Flagged Jobs"
+              },
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "count(status)"
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 8,
+            "y": 2,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "delta_bar",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "aa7078b8",
+                  "fields": [
+                    {
+                      "name": "delta",
+                      "expression": "`delta`"
+                    },
+                    {
+                      "name": "job_name",
+                      "expression": "`job_name`"
+                    }
+                  ],
+                  "filters": [
+                    {
+                      "expression": "`job_name` NOT IN ('TOTAL (all jobs)')"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "frame": {
+                "showTitle": true,
+                "title": {
+                  "value": "Top Cost Movers (WoW Delta)",
+                  "fields": []
+                }
+              },
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "delta",
+                  "displayName": "Delta ($)",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "y": {
+                  "fieldName": "job_name",
+                  "axis": {
+                    "hideLabels": true,
+                    "hideTitle": true
+                  },
+                  "displayName": "Job",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 4,
+            "width": 6,
+            "height": 10
+          }
+        },
+        {
+          "widget": {
+            "name": "anomaly_scatter",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "aa7078b8",
+                  "fields": [
+                    {
+                      "name": "pct_change",
+                      "expression": "`pct_change`"
+                    },
+                    {
+                      "name": "w6_vs_w1_w4_avg_pct",
+                      "expression": "`w6_vs_w1_w4_avg_pct`"
+                    }
+                  ],
+                  "filters": [
+                    {
+                      "expression": "`job_name` NOT IN ('TOTAL (all jobs)')"
+                    },
+                    {
+                      "expression": "`pct_change` IS NOT NULL"
+                    },
+                    {
+                      "expression": "`w6_vs_w1_w4_avg_pct` IS NOT NULL"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "frame": {
+                "showTitle": true,
+                "title": "Anomaly Detection"
+              },
+              "version": 3,
+              "widgetType": "scatter",
+              "encodings": {
+                "x": {
+                  "fieldName": "pct_change",
+                  "displayName": "WoW % Change (W6 vs W5)",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "y": {
+                  "fieldName": "w6_vs_w1_w4_avg_pct",
+                  "displayName": "W6 vs W1\u2013W4 Avg %",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 4,
+            "width": 6,
+            "height": 10
+          }
+        },
+        {
+          "widget": {
+            "name": "detail_table",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "aa7078b8",
+                  "fields": [
+                    {
+                      "name": "job_name",
+                      "expression": "`job_name`"
+                    },
+                    {
+                      "name": "n_names",
+                      "expression": "`n_names`"
+                    },
+                    {
+                      "name": "w1",
+                      "expression": "`w1`"
+                    },
+                    {
+                      "name": "w2",
+                      "expression": "`w2`"
+                    },
+                    {
+                      "name": "w3",
+                      "expression": "`w3`"
+                    },
+                    {
+                      "name": "w4",
+                      "expression": "`w4`"
+                    },
+                    {
+                      "name": "w5",
+                      "expression": "`w5`"
+                    },
+                    {
+                      "name": "w6",
+                      "expression": "`w6`"
+                    },
+                    {
+                      "name": "delta",
+                      "expression": "`delta`"
+                    },
+                    {
+                      "name": "pct_change",
+                      "expression": "`pct_change`"
+                    },
+                    {
+                      "name": "w6_vs_w1_w4_avg_pct",
+                      "expression": "`w6_vs_w1_w4_avg_pct`"
+                    },
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "frame": {
+                "showTitle": true,
+                "title": {
+                  "value": "Full Detail Table",
+                  "fields": []
+                }
+              },
+              "version": 2,
+              "rowsPerPage": 25,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "job_name",
+                    "useForSearch": true,
+                    "displayName": "Job"
+                  },
+                  {
+                    "fieldName": "n_names",
+                    "displayName": "# Combined"
+                  },
+                  {
+                    "fieldName": "w1",
+                    "format": {
+                      "type": "numeral.js",
+                      "format": "$0,0"
+                    },
+                    "displayName": "W1 ($)"
+                  },
+                  {
+                    "fieldName": "w2",
+                    "format": {
+                      "type": "numeral.js",
+                      "format": "$0,0"
+                    },
+                    "displayName": "W2 ($)"
+                  },
+                  {
+                    "fieldName": "w3",
+                    "format": {
+                      "type": "numeral.js",
+                      "format": "$0,0"
+                    },
+                    "displayName": "W3 ($)"
+                  },
+                  {
+                    "fieldName": "w4",
+                    "format": {
+                      "type": "numeral.js",
+                      "format": "$0,0"
+                    },
+                    "displayName": "W4 ($)"
+                  },
+                  {
+                    "fieldName": "w5",
+                    "format": {
+                      "type": "numeral.js",
+                      "format": "$0,0"
+                    },
+                    "displayName": "W5 ($)"
+                  },
+                  {
+                    "fieldName": "w6",
+                    "format": {
+                      "type": "numeral.js",
+                      "format": "$0,0"
+                    },
+                    "displayName": "W6 ($)"
+                  },
+                  {
+                    "fieldName": "delta",
+                    "format": {
+                      "type": "numeral.js",
+                      "format": "$0,0.00"
+                    },
+                    "displayName": "Delta ($)"
+                  },
+                  {
+                    "fieldName": "pct_change",
+                    "format": {
+                      "type": "numeral.js",
+                      "format": "0.0"
+                    },
+                    "displayName": "WoW %",
+                    "style": {
+                      "type": "basic",
+                      "rules": [
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "100"
+                            },
+                            "operator": ">="
+                          },
+                          "backgroundColor": "#f44336",
+                          "foregroundColor": "#FFFFFF"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "25"
+                            },
+                            "operator": ">="
+                          },
+                          "backgroundColor": "#ffcdd2",
+                          "foregroundColor": "#b71c1c"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0"
+                            },
+                            "operator": ">"
+                          },
+                          "backgroundColor": "#ffebee",
+                          "foregroundColor": "#c62828"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "-100"
+                            },
+                            "operator": "<="
+                          },
+                          "backgroundColor": "#2e7d32",
+                          "foregroundColor": "#FFFFFF"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "-25"
+                            },
+                            "operator": "<="
+                          },
+                          "backgroundColor": "#c8e6c9",
+                          "foregroundColor": "#1b5e20"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0"
+                            },
+                            "operator": "<"
+                          },
+                          "backgroundColor": "#e8f5e9",
+                          "foregroundColor": "#2e7d32"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "fieldName": "w6_vs_w1_w4_avg_pct",
+                    "format": {
+                      "type": "numeral.js",
+                      "format": "0.0"
+                    },
+                    "displayName": "W6 vs Avg %",
+                    "style": {
+                      "type": "basic",
+                      "rules": [
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "100"
+                            },
+                            "operator": ">="
+                          },
+                          "backgroundColor": "#f44336",
+                          "foregroundColor": "#FFFFFF"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "25"
+                            },
+                            "operator": ">="
+                          },
+                          "backgroundColor": "#ffcdd2",
+                          "foregroundColor": "#b71c1c"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0"
+                            },
+                            "operator": ">"
+                          },
+                          "backgroundColor": "#ffebee",
+                          "foregroundColor": "#c62828"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "-100"
+                            },
+                            "operator": "<="
+                          },
+                          "backgroundColor": "#2e7d32",
+                          "foregroundColor": "#FFFFFF"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "-25"
+                            },
+                            "operator": "<="
+                          },
+                          "backgroundColor": "#c8e6c9",
+                          "foregroundColor": "#1b5e20"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0"
+                            },
+                            "operator": "<"
+                          },
+                          "backgroundColor": "#e8f5e9",
+                          "foregroundColor": "#2e7d32"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "fieldName": "status",
+                    "displayName": "Status"
+                  }
+                ]
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 14,
+            "width": 12,
+            "height": 16
+          }
+        }
+      ],
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layoutVersion": "GRID_V1"
+    },
+    {
+      "name": "6e6f816c",
+      "displayName": "Global Filters",
+      "layout": [
+        {
+          "widget": {
+            "name": "be0ed7de",
+            "queries": [
+              {
+                "name": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f0b05575131d1bbfd48dad02f1634a_cost",
+                "query": {
+                  "datasetName": "c9c643a9",
+                  "fields": [
+                    {
+                      "name": "cost",
+                      "expression": "`cost`"
+                    },
+                    {
+                      "name": "cost_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_cloud_cost_type",
+                "query": {
+                  "datasetName": "9190182f",
+                  "parameters": [
+                    {
+                      "name": "cloud_cost_type",
+                      "keyword": "cloud_cost_type"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "cost",
+                    "queryName": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f0b05575131d1bbfd48dad02f1634a_cost"
+                  },
+                  {
+                    "parameterName": "cloud_cost_type",
+                    "queryName": "parameter_dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_cloud_cost_type"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Cost Type"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 1,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "8aace0c5",
+            "queries": [
+              {
+                "name": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f0b685c4fc1f6790f1d2f043a6b237_compute_type",
+                "query": {
+                  "datasetName": "165bc925",
+                  "fields": [
+                    {
+                      "name": "compute_type",
+                      "expression": "`compute_type`"
+                    },
+                    {
+                      "name": "compute_type_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_compute_type",
+                "query": {
+                  "datasetName": "9190182f",
+                  "parameters": [
+                    {
+                      "name": "compute_type",
+                      "keyword": "compute_type"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "compute_type",
+                    "queryName": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f0b685c4fc1f6790f1d2f043a6b237_compute_type"
+                  },
+                  {
+                    "parameterName": "compute_type",
+                    "queryName": "parameter_dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_compute_type"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Compute Type"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 4,
+            "width": 1,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "77b26f5a",
+            "queries": [
+              {
+                "name": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_compute_id",
+                "query": {
+                  "datasetName": "9190182f",
+                  "fields": [
+                    {
+                      "name": "compute_id",
+                      "expression": "`compute_id`"
+                    },
+                    {
+                      "name": "compute_id_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "compute_id",
+                    "queryName": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_compute_id"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Compute ID"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 6,
+            "width": 1,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "4bb3e28f",
+            "queries": [
+              {
+                "name": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_job_id",
+                "query": {
+                  "datasetName": "9190182f",
+                  "fields": [
+                    {
+                      "name": "job_id",
+                      "expression": "`job_id`"
+                    },
+                    {
+                      "name": "job_id_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "job_id",
+                    "queryName": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_job_id"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Job ID"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 8,
+            "width": 1,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "481fda44",
+            "queries": [
+              {
+                "name": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f0b0571db312aeafd5c089020ccedf_granularity",
+                "query": {
+                  "datasetName": "b19aacaf",
+                  "fields": [
+                    {
+                      "name": "granularity",
+                      "expression": "`granularity`"
+                    },
+                    {
+                      "name": "granularity_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_granularity",
+                "query": {
+                  "datasetName": "9190182f",
+                  "parameters": [
+                    {
+                      "name": "granularity",
+                      "keyword": "granularity"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "granularity",
+                    "queryName": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f0b0571db312aeafd5c089020ccedf_granularity"
+                  },
+                  {
+                    "parameterName": "granularity",
+                    "queryName": "parameter_dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_granularity"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Time Granularity"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 1,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "73dd4e26",
+            "queries": [
+              {
+                "name": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f0b690698b1f3c9882599874b4df22_toggle",
+                "query": {
+                  "datasetName": "844d2f16",
+                  "fields": [
+                    {
+                      "name": "toggle",
+                      "expression": "`toggle`"
+                    },
+                    {
+                      "name": "toggle_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_price_table",
+                "query": {
+                  "datasetName": "9190182f",
+                  "parameters": [
+                    {
+                      "name": "price_table",
+                      "keyword": "price_table"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "toggle",
+                    "queryName": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f0b690698b1f3c9882599874b4df22_toggle"
+                  },
+                  {
+                    "parameterName": "price_table",
+                    "queryName": "parameter_dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_price_table"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Databricks Prices (PrPr)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 10,
+            "width": 1,
+            "height": 2
+          }
+        }
+      ],
+      "pageType": "PAGE_TYPE_GLOBAL_FILTERS"
     },
     {
       "name": "b7ba496f",
@@ -1338,357 +2438,6 @@
       "pageType": "PAGE_TYPE_CANVAS"
     },
     {
-      "name": "6e6f816c",
-      "displayName": "Global Filters",
-      "layout": [
-        {
-          "widget": {
-            "name": "be0ed7de",
-            "queries": [
-              {
-                "name": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f0b05575131d1bbfd48dad02f1634a_cost",
-                "query": {
-                  "datasetName": "c9c643a9",
-                  "fields": [
-                    {
-                      "name": "cost",
-                      "expression": "`cost`"
-                    },
-                    {
-                      "name": "cost_associativity",
-                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              },
-              {
-                "name": "parameter_dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_cloud_cost_type",
-                "query": {
-                  "datasetName": "9190182f",
-                  "parameters": [
-                    {
-                      "name": "cloud_cost_type",
-                      "keyword": "cloud_cost_type"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              }
-            ],
-            "spec": {
-              "version": 2,
-              "widgetType": "filter-single-select",
-              "encodings": {
-                "fields": [
-                  {
-                    "fieldName": "cost",
-                    "queryName": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f0b05575131d1bbfd48dad02f1634a_cost"
-                  },
-                  {
-                    "parameterName": "cloud_cost_type",
-                    "queryName": "parameter_dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_cloud_cost_type"
-                  }
-                ]
-              },
-              "frame": {
-                "showTitle": true,
-                "title": "Cost Type"
-              }
-            }
-          },
-          "position": {
-            "x": 0,
-            "y": 2,
-            "width": 1,
-            "height": 2
-          }
-        },
-        {
-          "widget": {
-            "name": "8aace0c5",
-            "queries": [
-              {
-                "name": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f0b685c4fc1f6790f1d2f043a6b237_compute_type",
-                "query": {
-                  "datasetName": "165bc925",
-                  "fields": [
-                    {
-                      "name": "compute_type",
-                      "expression": "`compute_type`"
-                    },
-                    {
-                      "name": "compute_type_associativity",
-                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              },
-              {
-                "name": "parameter_dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_compute_type",
-                "query": {
-                  "datasetName": "9190182f",
-                  "parameters": [
-                    {
-                      "name": "compute_type",
-                      "keyword": "compute_type"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              }
-            ],
-            "spec": {
-              "version": 2,
-              "widgetType": "filter-single-select",
-              "encodings": {
-                "fields": [
-                  {
-                    "fieldName": "compute_type",
-                    "queryName": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f0b685c4fc1f6790f1d2f043a6b237_compute_type"
-                  },
-                  {
-                    "parameterName": "compute_type",
-                    "queryName": "parameter_dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_compute_type"
-                  }
-                ]
-              },
-              "frame": {
-                "showTitle": true,
-                "title": "Compute Type"
-              }
-            }
-          },
-          "position": {
-            "x": 0,
-            "y": 4,
-            "width": 1,
-            "height": 2
-          }
-        },
-        {
-          "widget": {
-            "name": "77b26f5a",
-            "queries": [
-              {
-                "name": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_compute_id",
-                "query": {
-                  "datasetName": "9190182f",
-                  "fields": [
-                    {
-                      "name": "compute_id",
-                      "expression": "`compute_id`"
-                    },
-                    {
-                      "name": "compute_id_associativity",
-                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              }
-            ],
-            "spec": {
-              "version": 2,
-              "widgetType": "filter-single-select",
-              "encodings": {
-                "fields": [
-                  {
-                    "fieldName": "compute_id",
-                    "queryName": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_compute_id"
-                  }
-                ]
-              },
-              "frame": {
-                "showTitle": true,
-                "title": "Compute ID"
-              }
-            }
-          },
-          "position": {
-            "x": 0,
-            "y": 6,
-            "width": 1,
-            "height": 2
-          }
-        },
-        {
-          "widget": {
-            "name": "4bb3e28f",
-            "queries": [
-              {
-                "name": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_job_id",
-                "query": {
-                  "datasetName": "9190182f",
-                  "fields": [
-                    {
-                      "name": "job_id",
-                      "expression": "`job_id`"
-                    },
-                    {
-                      "name": "job_id_associativity",
-                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              }
-            ],
-            "spec": {
-              "version": 2,
-              "widgetType": "filter-single-select",
-              "encodings": {
-                "fields": [
-                  {
-                    "fieldName": "job_id",
-                    "queryName": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_job_id"
-                  }
-                ]
-              },
-              "frame": {
-                "showTitle": true,
-                "title": "Job ID"
-              }
-            }
-          },
-          "position": {
-            "x": 0,
-            "y": 8,
-            "width": 1,
-            "height": 2
-          }
-        },
-        {
-          "widget": {
-            "name": "481fda44",
-            "queries": [
-              {
-                "name": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f0b0571db312aeafd5c089020ccedf_granularity",
-                "query": {
-                  "datasetName": "b19aacaf",
-                  "fields": [
-                    {
-                      "name": "granularity",
-                      "expression": "`granularity`"
-                    },
-                    {
-                      "name": "granularity_associativity",
-                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              },
-              {
-                "name": "parameter_dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_granularity",
-                "query": {
-                  "datasetName": "9190182f",
-                  "parameters": [
-                    {
-                      "name": "granularity",
-                      "keyword": "granularity"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              }
-            ],
-            "spec": {
-              "version": 2,
-              "widgetType": "filter-single-select",
-              "encodings": {
-                "fields": [
-                  {
-                    "fieldName": "granularity",
-                    "queryName": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f0b0571db312aeafd5c089020ccedf_granularity"
-                  },
-                  {
-                    "parameterName": "granularity",
-                    "queryName": "parameter_dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_granularity"
-                  }
-                ]
-              },
-              "frame": {
-                "showTitle": true,
-                "title": "Time Granularity"
-              }
-            }
-          },
-          "position": {
-            "x": 0,
-            "y": 0,
-            "width": 1,
-            "height": 2
-          }
-        },
-        {
-          "widget": {
-            "name": "73dd4e26",
-            "queries": [
-              {
-                "name": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f0b690698b1f3c9882599874b4df22_toggle",
-                "query": {
-                  "datasetName": "844d2f16",
-                  "fields": [
-                    {
-                      "name": "toggle",
-                      "expression": "`toggle`"
-                    },
-                    {
-                      "name": "toggle_associativity",
-                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              },
-              {
-                "name": "parameter_dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_price_table",
-                "query": {
-                  "datasetName": "9190182f",
-                  "parameters": [
-                    {
-                      "name": "price_table",
-                      "keyword": "price_table"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              }
-            ],
-            "spec": {
-              "version": 2,
-              "widgetType": "filter-single-select",
-              "encodings": {
-                "fields": [
-                  {
-                    "fieldName": "toggle",
-                    "queryName": "dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f0b690698b1f3c9882599874b4df22_toggle"
-                  },
-                  {
-                    "parameterName": "price_table",
-                    "queryName": "parameter_dashboards/01f0900004f71c25afdfafdb80b226c2/datasets/01f09000075116c8a84834293f79aace_price_table"
-                  }
-                ]
-              },
-              "frame": {
-                "showTitle": true,
-                "title": "Databricks Prices (PrPr)"
-              }
-            }
-          },
-          "position": {
-            "x": 0,
-            "y": 10,
-            "width": 1,
-            "height": 2
-          }
-        }
-      ],
-      "pageType": "PAGE_TYPE_GLOBAL_FILTERS"
-    },
-    {
       "name": "48d8c827",
       "displayName": "Cost by Tags",
       "layout": [
@@ -2128,7 +2877,9 @@
       "widgetHeaderAlignment": "LEFT"
     },
     "genieSpace": {
-      "isEnabled": false
-    }
+      "isEnabled": false,
+      "enablementMode": "ENABLEMENT_MODE_UNSPECIFIED"
+    },
+    "applyModeEnabled": false
   }
 }

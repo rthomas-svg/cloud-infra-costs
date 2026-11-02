@@ -1,6 +1,8 @@
 resources:
   dashboards:
     aws_cost_dashboard:
-      display_name: 'AWS Cost Dashboard'
+      display_name: 'AWS Cost Usage Dashboard'
       file_path: ../src/aws_cost_dashboard.lvdash.json
       warehouse_id: ${var.warehouse_id}
+      # Pinned to where the existing dashboard lives; changing parent_path forces a recreate (new id/URL).
+      parent_path: /Workspace/Users/rthomas@sovrn.com/.bundle/aws_cost/prd/files/src
